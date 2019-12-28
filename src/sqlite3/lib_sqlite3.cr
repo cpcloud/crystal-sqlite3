@@ -5,6 +5,15 @@ lib LibSQLite3
   type SQLite3 = Void*
   type Statement = Void*
   type SQLite3Backup = Void*
+  type SQLite3Context = Void*
+  type SQLite3Value = Void*
+
+  type ScalarFunc = (SQLite3Context, Int32, SQLite3Value*) ->
+  type StepFunc = (SQLite3Context, Int32, SQLite3Value*) ->
+  type FinalizeFunc = SQLite3Context ->
+  type ValueFunc = SQLite3Context ->
+  type InverseFunc = (SQLite3Context, Int32, SQLite3Value*) ->
+	alias Destructor = Void* ->
 
   enum Code
     OKAY =   0
@@ -49,4 +58,157 @@ lib LibSQLite3
   fun finalize = sqlite3_finalize(stmt : Statement) : Int32
   fun close_v2 = sqlite3_close_v2(SQLite3) : Int32
   fun close = sqlite3_close(SQLite3) : Int32
+
+  fun aggregate_context = sqlite3_aggregate_context(ctx : SQLite3Context, nBytes : Int32) : Void*
+  fun create_function = sqlite3_create_function(
+    db : SQLite3, name : UInt8*, nArg : Int32, eTextRep : Int32, pApp : Void*,
+    xFunc : ScalarFunc, xStep : StepFunc, xFinal : FinalizeFunc
+  ) : Int32
+
+  fun value_type = sqlite3_value_type(value : SQLite3Value) : Int32
+  fun value_int = sqlite3_value_int(value : SQLite3Value) : Int32
+  fun value_int64 = sqlite3_value_int64(value : SQLite3Value) : Int64
+  fun value_double = sqlite3_value_double(value : SQLite3Value) : Float64
+  fun value_blob = sqlite3_value_blob(SQLite3Value) : Void*
+  fun value_text = sqlite3_value_text(SQLite3Value) : UInt8*
+  fun value_bytes = sqlite3_value_bytes(SQLite3Value) : Int32
+
+  fun result_null = sqlite3_result_null(ctx : SQLite3Context)
+  fun result_int = sqlite3_result_int(ctx : SQLite3Context, result : Int32)
+  fun result_int64 = sqlite3_result_int64(ctx : SQLite3Context, result : Int64)
+  fun result_double = sqlite3_result_double(ctx : SQLite3Context, result : Float64)
+  fun result_text = sqlite3_result_text(ctx : SQLite3Context,
+                                        chars : UInt8*,
+                                        nchars : Int32,
+                                        destructor : Void* ->)
+  fun result_blob = sqlite3_result_blob(ctx : SQLite3Context,
+                                        bytes : Void*,
+                                        nbytes : Int32,
+                                        destructor : Void* ->)
+  fun user_data = sqlite3_user_data(ctx : SQLite3Context) : Void*
+  NULL          =     5
+  UTF8          =     1
+  DETERMINISTIC = 0x800
+	TRANSIENT = Pointer(Void).new(-1).unsafe_as(LibSQLite3::Destructor)
+	STATIC = Pointer(Void).new(0).unsafe_as(LibSQLite3::Destructor)
+end
+
+macro create_function(db, func, deterministic)
+	{{ func }}
+	{% args = func.args %}
+	{% nargs = args.size %}
+  LibSQLite3.create_function(
+    {{ db }},
+    "#{{{ func }}}",
+		{{ nargs }},
+    LibSQLite3::UTF8 | ({{ deterministic }} ? LibSQLite3::DETERMINISTIC : 0),
+    nil,
+    ->(ctx : LibSQLite3::SQLite3Context, argc : Int32, argv : LibSQLite3::SQLite3Value*) {
+      args = {
+        {% for i in 0...nargs %}
+          if LibSQLite3.value_type(argv[{{ i }}]) == LibSQLite3::NULL
+            nil
+          else
+            {% type = args[i].restriction.types[0].resolve %}
+            {% if type == Float64 %}
+              LibSQLite3.value_double(argv[{{ i }}])
+            {% elsif type == Int64 %}
+              LibSQLite3.value_int64(argv[{{ i }}])
+            {% elsif type == Int32 %}
+              LibSQLite3.value_int(argv[{{ i }}])
+            {% elsif type == String %}
+              String.new(LibSQLite3.value_text(argv[{{ i }}]),
+                         LibSQLite3.value_bytes(argv[{{ i }}]))
+            {% end %}
+          end,
+        {% end %}
+      }
+
+      result = {{ func }}(*args)
+
+			if !result.nil?
+				{% type = func.name.return_type.types[0].resolve %}
+				{% if type == Float64 %}
+					LibSQLite3.result_double(ctx, result)
+				{% elsif type == Int64 %}
+					LibSQLite3.result_int64(ctx, result)
+				{% elsif type == Int32 %}
+					LibSQLite3.result_int(ctx, result)
+				{% elsif type == String %}
+					LibSQLite3.result_text(
+						ctx, result.to_unsafe, result.size, LibSQLite3::TRANSIENT)
+				{% end %}
+			else
+				LibSQLite3.result_null(ctx)
+			end
+    },
+    nil,
+		nil,
+  )
+end
+
+
+macro create_aggregate(db, name, cls, deterministic)
+  LibSQLite3.create_function(
+    {{ db }},
+    {{ name }}.to_s.to_unsafe,
+    {{ cls.resolve.methods.find { |m| m.name == "step" }.args.size }},
+    LibSQLite3::UTF8 | ({{ deterministic }} ? LibSQLite3::DETERMINISTIC : 0),
+    nil,
+    nil,
+    ->(ctx : LibSQLite3::SQLite3Context, argc : Int32, argv : LibSQLite3::SQLite3Value*) {
+      nbytes = instance_sizeof({{ cls }})
+      raw = LibSQLite3.aggregate_context(ctx, nbytes)
+      if !raw.null?
+        {% type = cls.resolve %}
+        {% method = type.methods.find { |m| m.name == "step" } %}
+        {% args = method.args %}
+        args = {
+          {% for i in 0...(args.size) %}
+            if LibSQLite3.value_type(argv[{{ i }}]) == LibSQLite3::NULL
+              nil
+            else
+              {% type = args[i].restriction.types[0].resolve %}
+              {% if type == Float64 %}
+                LibSQLite3.value_double(argv[{{ i }}])
+              {% elsif type == Int64 %}
+                LibSQLite3.value_int64(argv[{{ i }}])
+              {% elsif type == Int32 %}
+                LibSQLite3.value_int(argv[{{ i }}])
+              {% elsif type == String %}
+                String.new(LibSQLite3.value_text(argv[{{ i }}]),
+                           LibSQLite3.value_bytes(argv[{{ i }}]))
+              {% end %}
+            end,
+          {% end %}
+        }
+				agg_ctx = raw.unsafe_as({{ cls }})
+        agg_ctx.step(*args)
+      end
+    },
+    ->(ctx : LibSQLite3::SQLite3Context) {
+      nbytes = instance_sizeof({{ cls }})
+      raw = LibSQLite3.aggregate_context(ctx, nbytes)
+      if !raw.null?
+				agg_ctx = raw.unsafe_as({{ cls }})
+        result = agg_ctx.final
+        if !result.nil?
+          {% finalize = cls.resolve.methods.find { |m| m.name == "final" } %}
+          {% type = finalize.return_type.types[0].resolve %}
+          {% if type == Float64 %}
+            LibSQLite3.result_double(ctx, result)
+          {% elsif type == Int64 %}
+            LibSQLite3.result_int64(ctx, result)
+          {% elsif type == Int32 %}
+            LibSQLite3.result_int(ctx, result)
+          {% elsif type == String %}
+            LibSQLite3.result_text(
+							ctx, result.to_unsafe, result.size, LibSQLite3::STATIC)
+          {% end %}
+        else
+          LibSQLite3.result_null(ctx)
+        end
+      end
+    },
+  )
 end
